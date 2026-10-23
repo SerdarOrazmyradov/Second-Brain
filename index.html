@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Second Brain</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/idb@8/build/umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+<style>
+  .md h1,.md h2,.md h3{margin:.6em 0 .3em;font-weight:700;line-height:1.25}
+  .md h1{font-size:1.5rem}.md h2{font-size:1.25rem}.md h3{font-size:1.1rem}
+  .md p{margin:.5em 0}
+  .md ul{list-style:disc;padding-left:1.25em;margin:.5em 0}
+  .md ol{list-style:decimal;padding-left:1.25em;margin:.5em 0}
+  .md a{color:var(--color-primary);text-decoration:underline}
+  .md code{background:color-mix(in oklab,var(--color-base-content) 12%,transparent);padding:.1em .3em;border-radius:.25rem;font-size:.9em}
+  .md pre{background:color-mix(in oklab,var(--color-base-content) 10%,transparent);padding:.75rem;border-radius:.5rem;overflow:auto;margin:.5em 0}
+  .md pre code{background:none;padding:0}
+  .md blockquote{border-left:3px solid var(--color-primary);padding-left:.75em;opacity:.8;margin:.5em 0}
+  .md hr{border-color:currentColor;opacity:.15;margin:1em 0}
+  .md table{width:100%;border-collapse:collapse;margin:.5em 0}
+  .md th,.md td{border:1px solid color-mix(in oklab,var(--color-base-content) 20%,transparent);padding:.25em .5em;text-align:left}
+</style>
+</head>
+<body class="min-h-screen bg-base-100">
+
+<header class="sticky top-0 z-20 border-b border-base-300 bg-base-100/95 backdrop-blur">
+  <div class="mx-auto flex max-w-6xl flex-wrap items-center gap-2 p-3">
+    <span class="text-lg font-bold whitespace-nowrap">🧠 Second Brain</span>
+    <input id="search" class="input input-sm input-bordered w-full sm:max-w-xs" placeholder="Search notes..." />
+    <div class="ml-auto flex flex-wrap gap-1">
+      <button id="newBtn" class="btn btn-primary btn-sm">New Note</button>
+      <button id="exportBtn" class="btn btn-ghost btn-sm">Export</button>
+      <button id="importBtn" class="btn btn-ghost btn-sm">Import</button>
+      <input id="file" type="file" accept="application/json" class="hidden" />
+    </div>
+  </div>
+</header>
+
+<main class="mx-auto max-w-6xl p-3 sm:p-4">
+  <div id="tags" class="mb-4 flex flex-wrap gap-1"></div>
+  <div id="notes" class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3"></div>
+</main>
+
+<dialog id="modal" class="modal">
+  <div class="modal-box flex h-[90vh] w-11/12 max-w-5xl flex-col">
+    <div class="mb-2 flex items-center gap-2">
+      <input id="title" class="input input-bordered flex-1" placeholder="Note title" />
+      <button id="closeModal" class="btn btn-ghost btn-sm">✕</button>
+    </div>
+    <input id="tagsInput" class="input input-bordered input-sm mb-3 w-full" placeholder="tags, comma, separated" />
+    <div class="grid min-h-0 flex-1 gap-3 md:grid-cols-2">
+      <textarea id="content" class="textarea textarea-bordered h-64 w-full resize-none font-mono text-sm md:h-full" placeholder="Write Markdown... Use [[Note Title]] to link notes."></textarea>
+      <div id="preview" class="md h-64 overflow-auto rounded-box bg-base-200 p-4 text-sm md:h-full"></div>
+    </div>
+    <div id="backlinks" class="mt-3"></div>
+    <div class="modal-action">
+      <button id="deleteBtn" class="btn btn-error btn-outline btn-sm">Delete</button>
+      <button id="saveBtn" class="btn btn-primary btn-sm">Save</button>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<dialog id="importModal" class="modal">
+  <div class="modal-box">
+    <h3 class="text-lg font-bold">Import notes</h3>
+    <p id="importInfo" class="py-4 text-sm opacity-70"></p>
+    <div class="modal-action">
+      <button id="mergeBtn" class="btn btn-sm">Merge</button>
+      <button id="replaceBtn" class="btn btn-primary btn-sm">Replace</button>
+      <form method="dialog"><button class="btn btn-ghost btn-sm">Cancel</button></form>
+    </div>
+  </div>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const uid = () => crypto.randomUUID();
+const linksOf = n => [...(n.content || '').matchAll(/\[\[([^\]]+)\]\]/g)].map(m => m[1].trim());
+
+let notes = [], editing = null, isNew = false, filterTag = '', pending = [];
+
+const dbp = idb.openDB('second-brain', 1, {
+  upgrade(db) { db.createObjectStore('notes', { keyPath: 'id' }); }
+});
+
+const normalize = n => ({
+  id: n.id || uid(),
+  title: n.title || 'Untitled',
+  content: n.content || '',
+  tags: Array.isArray(n.tags) ? n.tags.map(String) : [],
+  createdAt: n.createdAt || Date.now(),
+  updatedAt: n.updatedAt || Date.now()
+});
+
+const md = s => DOMPurify.sanitize(marked.parse(s || ''))
+  .replace(/\[\[([^\]]+)\]\]/g, (_, t) => `<a href="#" data-link="${esc(t)}" class="link link-primary">${esc(t)}</a>`);
+
+const load = async () => {
+  const db = await dbp;
+  notes = (await db.getAll('notes')).sort((a, b) => b.updatedAt - a.updatedAt);
+  render();
+};
+
+const put = async n => { const db = await dbp; await db.put('notes', n); await load(); };
+const remove = async id => { const db = await dbp; await db.delete('notes', id); await load(); };
+
+const card = n => `
+<article data-id="${n.id}" class="card cursor-pointer bg-base-200 shadow-sm transition-colors hover:bg-base-300">
+  <div class="card-body gap-2 p-4">
+    <h2 class="card-title text-base leading-tight">${esc(n.title)}</h2>
+    <p class="line-clamp-2 text-sm opacity-60">${esc((n.content || '').replace(/[#*`>\[\]]/g, '').slice(0, 160) || 'No content')}</p>
+    ${n.tags.length ? `<div class="flex flex-wrap gap-1">${n.tags.map(t => `<span class="badge badge-primary badge-outline badge-sm">${esc(t)}</span>`).join('')}</div>` : ''}
+    <div class="text-xs opacity-40">${new Date(n.updatedAt).toLocaleDateString()}</div>
+  </div>
+</article>`;
+
+const renderTags = () => {
+  const tags = [...new Set(notes.flatMap(n => n.tags))].sort();
+  $('#tags').innerHTML = ['', ...tags].map(t =>
+    `<button data-tag="${esc(t)}" class="btn btn-xs ${t === filterTag ? 'btn-primary' : 'btn-ghost'}">${esc(t || 'All')}</button>`
+  ).join('');
+};
+
+const render = () => {
+  const q = $('#search').value.trim().toLowerCase();
+  const list = notes.filter(n =>
+    (!filterTag || n.tags.includes(filterTag)) &&
+    (!q || [n.title, n.content, ...n.tags].join(' ').toLowerCase().includes(q))
+  );
+  $('#notes').innerHTML = list.length ? list.map(card).join('')
+    : `<div class="col-span-full py-16 text-center opacity-50">No notes found.</div>`;
+  renderTags();
+};
+
+const renderBacklinks = () => {
+  const title = $('#title').value.trim().toLowerCase();
+  const list = title
+    ? notes.filter(n => n.id !== editing?.id && linksOf(n).some(t => t.toLowerCase() === title))
+    : [];
+  $('#backlinks').innerHTML = list.length
+    ? `<p class="mb-1 text-xs uppercase opacity-50">Backlinks</p>
+       <div class="flex flex-wrap gap-1">${list.map(n => `<button data-open="${n.id}" class="btn btn-xs">${esc(n.title)}</button>`).join('')}</div>`
+    : '';
+};
+
+const updatePreview = () => {
+  $('#preview').innerHTML = md($('#content').value) || '<span class="opacity-40">Nothing to preview</span>';
+  renderBacklinks();
+};
+
+const openEditor = (note, fresh) => {
+  editing = { ...note };
+  isNew = fresh;
+  $('#title').value = note.title;
+  $('#tagsInput').value = note.tags.join(', ');
+  $('#content').value = note.content;
+  $('#deleteBtn').classList.toggle('hidden', fresh);
+  updatePreview();
+  $('#modal').showModal();
+};
+
+const saveNote = async () => {
+  const note = {
+    ...editing,
+    title: $('#title').value.trim() || 'Untitled',
+    tags: $('#tagsInput').value.split(',').map(t => t.trim()).filter(Boolean),
+    content: $('#content').value,
+    updatedAt: Date.now()
+  };
+  await put(note);
+  $('#modal').close();
+};
+
+const exportJSON = () => {
+  const blob = new Blob([JSON.stringify(notes, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `second-brain-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+const writeAll = async (list, clear) => {
+  const db = await dbp;
+  const tx = db.transaction('notes', 'readwrite');
+  if (clear) await tx.store.clear();
+  await Promise.all(list.map(n => tx.store.put(n)));
+  await tx.done;
+  $('#importModal').close();
+  await load();
+};
+
+$('#search').addEventListener('input', render);
+
+$('#tags').addEventListener('click', e => {
+  const b = e.target.closest('[data-tag]');
+  if (!b) return;
+  filterTag = b.dataset.tag;
+  render();
+});
+
+$('#notes').addEventListener('click', e => {
+  const el = e.target.closest('[data-id]');
+  const n = el && notes.find(x => x.id === el.dataset.id);
+  if (n) openEditor(n, false);
+});
+
+$('#backlinks').addEventListener('click', e => {
+  const b = e.target.closest('[data-open]');
+  const n = b && notes.find(x => x.id === b.dataset.open);
+  if (n) openEditor(n, false);
+});
+
+$('#preview').addEventListener('click', e => {
+  const a = e.target.closest('[data-link]');
+  if (!a) return;
+  e.preventDefault();
+  const n = notes.find(x => x.title.toLowerCase() === a.dataset.link.toLowerCase());
+  if (n) openEditor(n, false);
+});
+
+$('#newBtn').addEventListener('click', () =>
+  openEditor({ id: uid(), title: '', content: '', tags: [], createdAt: Date.now(), updatedAt: Date.now() }, true));
+
+$('#closeModal').addEventListener('click', () => $('#modal').close());
+$('#saveBtn').addEventListener('click', saveNote);
+$('#title').addEventListener('input', renderBacklinks);
+$('#content').addEventListener('input', updatePreview);
+
+$('#deleteBtn').addEventListener('click', async () => {
+  if (!confirm('Delete this note?')) return;
+  await remove(editing.id);
+  $('#modal').close();
+});
+
+$('#exportBtn').addEventListener('click', exportJSON);
+$('#importBtn').addEventListener('click', () => $('#file').click());
+
+$('#file').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  try {
+    const data = JSON.parse(await f.text());
+    pending = (Array.isArray(data) ? data : data.notes || []).map(normalize);
+    $('#importInfo').textContent = `${pending.length} note(s) found. Merge with or replace existing notes?`;
+    $('#importModal').showModal();
+  } catch {
+    alert('Invalid JSON file.');
+  }
+});
+
+$('#mergeBtn').addEventListener('click', () => writeAll(pending, false));
+$('#replaceBtn').addEventListener('click', () => writeAll(pending, true));
+
+load();
+</script>
+</body>
+</html>
